@@ -34,6 +34,7 @@ from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader, pad_to_shape, set_weight_loader
 
 from . import ops
+from .kernels import kv_flat as KV
 from . import weights as W
 from .config import Inkling2Config
 
@@ -147,10 +148,11 @@ class PagedIO(ops.LayerIO):
         rows = []
         for j in range(STATE_LAYERS):
             blk = self._block_of(state_name(j), self.read_pos, bs)
-            kp, vp = model.state_planes[j]
-            # whole-block reads (one contiguous row a request): an element-indexed gather of the record costs an
-            # indirect copy per element (measured 16.7 ms a row a step)
-            rows += [kp.index_select(0, blk), vp.index_select(0, blk)]
+            # whole blocks through the flat buffer (an element-indexed gather of the record costs an indirect copy
+            # per element: measured 16.7 ms a row a step)
+            flat, dims = model._state_flat[j]
+            kb, vb = KV.gather_kv(flat, blk, dims)
+            rows += [kb.reshape(B, -1), vb.reshape(B, -1)]
         rec = torch.cat(rows, dim=1)[:, :L.total]
         if reset is not None:
             rec = rec * reset.to(rec.dtype)
@@ -177,11 +179,10 @@ class PagedIO(ops.LayerIO):
 
     def kv(self, c, k, v, window=None):
         name = cache_name(c)
-        kc, vc = self.m.kv_cache[c]
-        n, _, block, d = kc.shape
+        flat, dims = self.m._kv_flat[c]
+        n, _, block, d = dims
         blk, pos = paged_slot_indices(self.md[name]["slot_mapping"].reshape(-1), block, n)
-        kc[blk, 0, pos] = k.transpose(1, 2).reshape(-1, d)
-        vc[blk, 0, pos] = v.transpose(1, 2).reshape(-1, d)
+        token = KV.write_kv(flat, k.transpose(1, 2).reshape(-1, d), v.transpose(1, 2).reshape(-1, d), blk, pos, 1, dims)
         table, first = self._table(name)
         if window is not None and self.S > 1:
             # a sliding layer's prefill chunk reads only the blocks of its window (about S + window keys)
@@ -190,8 +191,8 @@ class PagedIO(ops.LayerIO):
             # full layers read the request's table; a sliding layer's decode table is already cut to the window
             blocks = table
         nr = blocks.shape[1]
-        k_ctx = kc.index_select(0, blocks.reshape(-1)).view(self.B, 1, nr * block, d)
-        v_ctx = vc.index_select(0, blocks.reshape(-1)).view(self.B, 1, nr * block, d)
+        kb, vb = KV.gather_kv(flat, blocks.reshape(-1), dims, after=token)
+        k_ctx, v_ctx = kb.reshape(self.B, 1, nr * block, d), vb.reshape(self.B, 1, nr * block, d)
         kv_pos = first.view(-1, 1) + torch.arange(nr * block, device=k.device).view(1, -1)
         return k_ctx, v_ctx, kv_pos
 
@@ -239,10 +240,14 @@ class PagedIO(ops.LayerIO):
         parts = [windows[(c, s)].reshape(self.B, -1) for c in range(self.m.config.cache_layers) for s in range(4)]
         rec = torch.cat(parts, dim=1)
         rec = torch.cat([rec, rec.new_zeros(self.B, 2 * STATE_LAYERS * L.plane_block - L.total)], dim=1)
+        bs = L.block_size
+        pos = torch.arange(bs, device=rec.device).repeat(self.B)
         for j in range(STATE_LAYERS):
-            kp, vp = self.m.state_planes[j]
-            kp.index_copy_(0, blk[j], rec[:, (2 * j) * L.plane_block:(2 * j + 1) * L.plane_block])
-            vp.index_copy_(0, blk[j], rec[:, (2 * j + 1) * L.plane_block:(2 * j + 2) * L.plane_block])
+            flat, dims = self.m._state_flat[j]
+            d = dims[-1]
+            KV.write_kv(flat, rec[:, (2 * j) * L.plane_block:(2 * j + 1) * L.plane_block].reshape(-1, d),
+                        rec[:, (2 * j + 1) * L.plane_block:(2 * j + 2) * L.plane_block].reshape(-1, d),
+                        blk[j].repeat_interleave(bs), pos, 1, dims)
 
     def publish(self):
         """Write the new windows to the block of the step's last token, and in prefill also the windows at the end of
@@ -383,26 +388,6 @@ class Inkling2ForCausalLM(nn.Module):
         for name, (_, shape) in zip([state_name(j) for j in range(STATE_LAYERS)], self._state_flat):
             if shape[-3] * shape[-2] * shape[-1] != L.plane_block:
                 raise ValueError(f"{name}: cache {shape}, expected {L.plane_block} elements a block")
-
-    @staticmethod
-    def _planes(flat_and_shape):
-        f, shape = flat_and_shape
-        n = f.numel() // 2
-        return f[:n].view(shape), f[n:].view(shape)
-
-    @property
-    def kv_cache(self):
-        """Each cache layer's ``(K, V)`` ``[N, 1, block, d]``: views of its buffer's flat tensor, made per forward."""
-        return [self._planes(x) for x in self._kv_flat]
-
-    @property
-    def state_planes(self):
-        """Each state layer's K and V planes as ``[N, block * d]`` rows (views of the flat tensors)."""
-        out = []
-        for x in self._state_flat:
-            k, v = self._planes(x)
-            out.append((k.reshape(k.shape[0], -1), v.reshape(v.shape[0], -1)))
-        return out
 
     # -- forward --
 

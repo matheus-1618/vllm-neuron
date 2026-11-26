@@ -150,9 +150,14 @@ def model_stub(cfg, caches, names):
                               block_end_records=True,
                               tp_group=types.SimpleNamespace(world_size=1))
     m.state_layout = M.StateLayout(cfg, BS)
-    m.kv_cache = [caches[M.cache_name(c)] for c in range(cfg.cache_layers)]
-    m.state_planes = [(caches[M.state_name(j)][0].reshape(NBLK, -1), caches[M.state_name(j)][1].reshape(NBLK, -1))
-                      for j in range(M.STATE_LAYERS)]
+    shared = {}
+
+    def flat(n):
+        k, v = caches[n]
+        return M.Inkling2ForCausalLM._flat_kv(k, v, shared), tuple(k.shape)
+
+    m._kv_flat = [flat(M.cache_name(c)) for c in range(cfg.cache_layers)]
+    m._state_flat = [flat(M.state_name(j)) for j in range(M.STATE_LAYERS)]
     return m
 
 
@@ -172,7 +177,7 @@ def test_paged_io_matches_contiguous(pad_row, monkeypatch):
     sliding = {M.cache_name(c): not cfg.is_full(cfg.cache_layer_model(c)) for c in range(cfg.cache_layers)}
     sliding.update({M.state_name(j): True for j in range(M.STATE_LAYERS)})
     d = cfg.head_dim
-    caches = {n: (torch.zeros(NBLK, 1, BS, d), torch.zeros(NBLK, 1, BS, d)) for n in names}
+    caches = {n: tuple(torch.zeros(2, NBLK, 1, BS, d).unbind(0)) for n in names}
     stub = model_stub(cfg, caches, names)
     ref = ContiguousIO(cfg)
     T, chunk, n_dec = 160, 32, 24          # 5 prefill chunks (2.5 windows), then decode steps
@@ -218,7 +223,7 @@ def test_prefix_hit_matches_contiguous(monkeypatch):
     sliding = {M.cache_name(c): not cfg.is_full(cfg.cache_layer_model(c)) for c in range(cfg.cache_layers)}
     sliding.update({M.state_name(j): True for j in range(M.STATE_LAYERS)})
     d = cfg.head_dim
-    caches = {n: (torch.zeros(NBLK, 1, BS, d), torch.zeros(NBLK, 1, BS, d)) for n in names}
+    caches = {n: tuple(torch.zeros(2, NBLK, 1, BS, d).unbind(0)) for n in names}
     stub = model_stub(cfg, caches, names)
     P, chunk, T, n_dec = 96, 64, 160, 8
     ids = torch.randint(0, 1000, (1, T + n_dec), generator=g)
@@ -270,6 +275,5 @@ def test_layers_sharing_a_buffer_get_one_flat_tensor():
     a = M.Inkling2ForCausalLM._flat_kv(k, v, shared)
     b = M.Inkling2ForCausalLM._flat_kv(k2, v2, shared)
     assert a is b and a.numel() == buf.numel()
-    kp, vp = M.Inkling2ForCausalLM._planes((a, (4, 1, 8, 16)))
-    kp[1, 0, 2, 3] = 5.0
-    assert k[1, 0, 2, 3] == 5.0 and vp.data_ptr() == v.data_ptr()
+    a.view(2, 4, 1, 8, 16)[0, 1, 0, 2, 3] = 5.0
+    assert k[1, 0, 2, 3] == 5.0
