@@ -2,8 +2,8 @@
 """vLLM ModelRegistry entry for Inkling 2 Mini (text decoder only).
 
 The class does not implement vLLM's ``IsHybrid`` interface: that would make vLLM allocate a Mamba state cache the
-Neuron runner cannot use. The short-convolution windows are declared as KV-cache layers instead (``state.py``), which
-needs the prefix cache off: two requests that shared a cached prefix would share its first block, and so its state.
+Neuron runner cannot use. The short-convolution windows are declared as KV-cache layers instead (``model.py``), which
+needs the prefix cache off: two requests that shared a cached block would share the state record in it.
 """
 
 import torch.nn as nn
@@ -61,5 +61,8 @@ class Inkling2ForConditionalGeneration(nn.Module):
         except Exception:  # noqa: BLE001 (no vLLM config outside an engine, e.g. unit tests)
             return
         if getattr(cache, "enable_prefix_caching", False):
-            raise ValueError("the Inkling 2 contrib model keeps the short-convolution windows in the request's first "
-                             "KV block; serve with --no-enable-prefix-caching")
+            raise ValueError("the Inkling 2 contrib model keeps the short-convolution windows in the block of a "
+                             "request's last token; serve with --no-enable-prefix-caching")
+        if getattr(cache, "block_size", None) not in (None, 128):
+            raise ValueError("the Inkling 2 contrib model needs --block-size 128 (the sliding-window layers' decode "
+                             f"tables are cut in units of 128 tokens), got {cache.block_size}")

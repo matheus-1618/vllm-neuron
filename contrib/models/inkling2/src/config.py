@@ -118,6 +118,10 @@ class Inkling2Config:
     def loop_layers(self) -> int:
         return self.loop_end - self.loop_start
 
+    def cache_layer_model(self, c: int) -> int:
+        """The model layer that cache layer ``c`` belongs to (``text_model``'s visit order)."""
+        return c if c < self.num_layers else self.loop_start + (c - self.num_layers) % self.loop_layers
+
     @property
     def cache_layers(self) -> int:
         """One KV and conv-state cache per layer visit: the core layers once per pass."""

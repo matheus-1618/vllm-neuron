@@ -5,12 +5,14 @@ The arithmetic is ``ops.py`` (checked against Hugging Face, ``test/unit``); this
 rank's weights (``weights.py``), the caches and the vLLM plumbing.
 
 Caches. Every layer visit has its own cache layer: 24 layers plus the 12 loop-core layers twice more, 48 in all
-(``Inkling2Config.cache_layers``), each one KV head of 128 a rank. All are declared as full-attention layers of one
-cache group, so they share the block table. The 20 sliding-window layers read only the blocks that cover their window
-(``ops.window_blocks``) and the attention mask drops the rest; their cache layers still hold the whole context. The
-short convolutions' input windows (3 tokens per convolution, 4 convolutions per cache layer) are an extra KV layer,
-``state.conv``, addressed by each request's first block and read and written as one block row a request: with the
-prefix cache off (``factory.py``) no two live requests share a first block.
+(``Inkling2Config.cache_layers``), each one KV head of 128 a rank. The 8 full-attention visits are full-attention
+layers; the 40 sliding-window visits are sliding-window layers (vLLM's hybrid KV cache manager frees their blocks
+outside the window), read through the blocks that cover the window (``ops.window_blocks``; in decode the runner
+hands a block table already cut to the window, with the position of its first key). The short convolutions' input
+windows (3 tokens per convolution, 4 convolutions per cache layer, ``StateLayout``) are a record per request held in
+``STATE_LAYERS`` extra sliding-window layers: the record of a request lives in the block of its last processed
+token, read there at the start of a step and written to the block of the step's last token (with the prefix cache
+off, ``factory.py``, no two live requests share a block).
 
 A prefill step is one request's chunk; a decode step is one token per row.
 """
@@ -39,7 +41,11 @@ logger = logging.getLogger(__name__)
 
 DTYPE = torch.bfloat16
 F32 = torch.float32
-STATE_LAYER = "state.conv"
+STATE_LAYERS = 24        # 2 planes x 128 tokens x 128 a layer-block; the record of a request is 700,416 elements
+
+
+def state_name(j: int) -> str:
+    return f"state.conv.{j}"
 
 
 def _nki(kernel):
@@ -99,59 +105,86 @@ class Layer(nn.Module):
 
 class StateLayout:
     """The conv windows of one request: per cache layer, keys ``[3, kv_ch]``, values ``[3, kv_ch]``, attention
-    output ``[3, H]``, MoE output ``[3, H]`` (bf16, oldest first), cache layers in order; the first half of the
-    record in the state layer's K plane and the second half in its V plane, each at the request's first block."""
+    output ``[3, H]``, MoE output ``[3, H]`` (bf16, oldest first), cache layers in order. The record is cut into
+    ``2 * STATE_LAYERS`` rows of one block's plane (``block_size * head_dim`` elements): row ``2 j`` in the K plane of
+    state layer ``j``, row ``2 j + 1`` in its V plane."""
 
     def __init__(self, cfg: Inkling2Config, block_size: int):
         kv_ch, H = cfg.kv_heads_per_rank * cfg.head_dim, cfg.hidden_size
         self.widths = (kv_ch, kv_ch, H, H)
         self.per_layer = ops.CONV_WINDOW * sum(self.widths)
         self.total = cfg.cache_layers * self.per_layer
-        self.half = -(-self.total // 2)
         self.block_size = block_size
-        self.head_size = -(-self.half // block_size)
-        self.plane_block = block_size * self.head_size          # elements of one block in one plane
+        self.plane_block = block_size * cfg.kv_heads_per_rank * cfg.head_dim   # elements of one block in one plane
+        self.rows = -(-self.total // self.plane_block)
+        if self.rows > 2 * STATE_LAYERS:
+            raise ValueError(f"the conv-state record ({self.total} elements) needs {self.rows} block planes, "
+                             f"{STATE_LAYERS} state layers hold {2 * STATE_LAYERS} at block size {block_size}")
 
     def offset(self, c: int, slot: int) -> int:
         return c * self.per_layer + ops.CONV_WINDOW * sum(self.widths[:slot])
 
 
 class PagedIO(ops.LayerIO):
-    """``ops.LayerIO`` over vLLM's paged caches for one step: ``B`` rows of ``S`` tokens."""
+    """``ops.LayerIO`` over vLLM's paged caches for one step: ``B`` rows of ``S`` tokens, each cache layer through its
+    own cache group's metadata (``attn_metadata[name]``: block table, slot mapping, and in decode for a
+    sliding-window group the table cut to the window with ``swa_kv_pos_offset``, the position of its first key)."""
 
-    def __init__(self, model: "Inkling2ForCausalLM", positions, block_table, slot_mapping, first_blocks, valid,
-                 reset, B: int, S: int):
-        # padding entries of the block table are -1: read the null block there (its positions are past the
-        # request's length, so the causal mask drops them)
-        self.m, self.positions, self.slot_mapping = model, positions, slot_mapping
-        self.block_table = block_table.to(torch.int64).clamp(min=0)
+    def __init__(self, model: "Inkling2ForCausalLM", attn_metadata, positions, valid, reset, B: int, S: int):
+        self.m, self.md, self.positions = model, attn_metadata, positions
         self.B, self.S, self.valid = B, S, valid
+        md0 = attn_metadata[cache_name(0)]
         # decode rows the runner padded (slot 0, the null block's first slot, as in prefill): the NKI MoE skips
         # their expert loads
-        self.valid_rows = (slot_mapping.reshape(B, S)[:, 0] > 0) if S == 1 else None
+        self.valid_rows = (md0["slot_mapping"].reshape(B, S)[:, 0] > 0) if S == 1 else None
         L = model.state_layout
-        planes = model.state_planes                    # [N, plane_block] each: one row per block
-        # whole-block reads and writes (one contiguous row a request): an element-indexed gather of the record
-        # costs an indirect copy per element (measured 16.7 ms a row a step)
-        self.first = first_blocks.to(torch.int64).clamp(min=0)
-        rec = torch.cat([planes[0].index_select(0, self.first)[:, :L.half],
-                         planes[1].index_select(0, self.first)[:, :L.half]], dim=1)[:, :L.total]
+        bs = L.block_size
+        # the record is read in the block of the last processed token and written in the block of this step's last
+        # token (padding rows read and write the null block)
+        q0 = positions[:, 0]
+        self.read_pos = (q0 - 1).clamp(min=0)
+        self.write_pos = q0 + (valid - 1 if S > 1 else 0)
+        rows = []
+        for j in range(STATE_LAYERS):
+            blk = self._block_of(state_name(j), self.read_pos, bs)
+            kp, vp = model.state_planes[j]
+            # whole-block reads (one contiguous row a request): an element-indexed gather of the record costs an
+            # indirect copy per element (measured 16.7 ms a row a step)
+            rows += [kp.index_select(0, blk), vp.index_select(0, blk)]
+        rec = torch.cat(rows, dim=1)[:, :L.total]
         if reset is not None:
             rec = rec * reset.to(rec.dtype)
         self.rec = rec
         self.new = {}
 
+    def _table(self, name):
+        """The layer's block table (rows of this step) and the position of its first block's first key."""
+        md = self.md[name]
+        table = md["block_table_tensor"][:self.B].to(torch.int64).clamp(min=0)   # padding entries are -1
+        off = md.get("swa_kv_pos_offset")
+        first = off[:self.B].to(torch.int64) if off is not None else torch.zeros_like(table[:, 0])
+        return table, first
+
+    def _block_of(self, name, pos, bs):
+        """The block that holds position ``pos [B]`` in the layer's table."""
+        table, first = self._table(name)
+        j = torch.div(pos - first, bs, rounding_mode="floor").clamp(0, table.shape[1] - 1)
+        return table.gather(1, j.view(-1, 1)).view(-1)
+
     def kv(self, c, k, v, window=None):
+        name = cache_name(c)
         kc, vc = self.m.kv_cache[c]
         n, _, block, d = kc.shape
-        blk, pos = paged_slot_indices(self.slot_mapping, block, n)
+        blk, pos = paged_slot_indices(self.md[name]["slot_mapping"].reshape(-1), block, n)
         kc[blk, 0, pos] = k.transpose(1, 2).reshape(-1, d)
         vc[blk, 0, pos] = v.transpose(1, 2).reshape(-1, d)
-        if window is None:
-            blocks, first = self.block_table, torch.zeros(self.B, dtype=torch.int64, device=k.device)
+        table, first = self._table(name)
+        if window is not None and self.S > 1:
+            # a sliding layer's prefill chunk reads only the blocks of its window (about S + window keys)
+            blocks, first = ops.window_blocks(table, self.positions[:, 0], self.S, window, block)
         else:
-            # a sliding layer reads only the blocks of its window (about S + window keys, not the whole context)
-            blocks, first = ops.window_blocks(self.block_table, self.positions[:, 0], self.S, window, block)
+            # full layers read the request's table; a sliding layer's decode table is already cut to the window
+            blocks = table
         nr = blocks.shape[1]
         k_ctx = kc.index_select(0, blocks.reshape(-1)).view(self.B, 1, nr * block, d)
         v_ctx = vc.index_select(0, blocks.reshape(-1)).view(self.B, 1, nr * block, d)
@@ -194,15 +227,16 @@ class PagedIO(ops.LayerIO):
         return tp.all_reduce(x) if tp.world_size > 1 else x
 
     def publish(self):
-        """Write every new window back to the request's first block (padding rows go to the null block)."""
+        """Write every new window to the block of the step's last token (padding rows go to the null block)."""
         L = self.m.state_layout
         parts = [self.new[(c, s)].reshape(self.B, -1) for c in range(self.m.config.cache_layers) for s in range(4)]
         rec = torch.cat(parts, dim=1)
-        rec = torch.cat([rec[:, :L.half], rec.new_zeros(self.B, L.plane_block - L.half),
-                         rec[:, L.half:], rec.new_zeros(self.B, L.plane_block - (L.total - L.half))], dim=1)
-        planes = self.m.state_planes
-        planes[0].index_copy_(0, self.first, rec[:, :L.plane_block])
-        planes[1].index_copy_(0, self.first, rec[:, L.plane_block:])
+        rec = torch.cat([rec, rec.new_zeros(self.B, 2 * STATE_LAYERS * L.plane_block - L.total)], dim=1)
+        for j in range(STATE_LAYERS):
+            blk = self._block_of(state_name(j), self.write_pos, L.block_size)
+            kp, vp = self.m.state_planes[j]
+            kp.index_copy_(0, blk, rec[:, (2 * j) * L.plane_block:(2 * j + 1) * L.plane_block])
+            vp.index_copy_(0, blk, rec[:, (2 * j + 1) * L.plane_block:(2 * j + 2) * L.plane_block])
 
 
 class Inkling2ForCausalLM(nn.Module):
@@ -286,9 +320,13 @@ class Inkling2ForCausalLM(nn.Module):
         if self.block_size is None:
             raise RuntimeError("the Inkling 2 model was built outside a vLLM engine config")
         self.state_layout = StateLayout(c, self.block_size)
-        layers = [LayerSpec(name=cache_name(i), num_kv_heads=c.kv_heads_per_rank, head_size=c.head_dim, dtype=DTYPE)
-                  for i in range(c.cache_layers)]
-        layers.append(LayerSpec(name=STATE_LAYER, num_kv_heads=1, head_size=self.state_layout.head_size, dtype=DTYPE))
+
+        def spec(name, sliding):
+            return LayerSpec(name=name, num_kv_heads=c.kv_heads_per_rank, head_size=c.head_dim, dtype=DTYPE,
+                             sliding_window_size=c.window if sliding else None)
+
+        layers = [spec(cache_name(i), not c.is_full(c.cache_layer_model(i))) for i in range(c.cache_layers)]
+        layers += [spec(state_name(j), True) for j in range(STATE_LAYERS)]
         return KVSpec(layers=layers)
 
     def bind_kv_cache(self, kv_caches: dict) -> None:
@@ -296,12 +334,13 @@ class Inkling2ForCausalLM(nn.Module):
             self.get_kv_spec()
         self.kv_cache = [(kv_caches[cache_name(i)][0], kv_caches[cache_name(i)][1])
                          for i in range(self.config.cache_layers)]
-        planes = kv_caches[STATE_LAYER]
-        self.state_planes = [planes[0].reshape(planes[0].shape[0], -1), planes[1].reshape(planes[1].shape[0], -1)]
         L = self.state_layout
-        if planes[0].shape[-2] * planes[0].shape[-1] != L.plane_block:
-            raise ValueError(f"{STATE_LAYER}: cache {tuple(planes[0].shape)}, expected {L.block_size} x "
-                             f"{L.head_size} per block")
+        self.state_planes = []
+        for j in range(STATE_LAYERS):
+            k, v = kv_caches[state_name(j)][0], kv_caches[state_name(j)][1]
+            if k.shape[-3] * k.shape[-2] * k.shape[-1] != L.plane_block:
+                raise ValueError(f"{state_name(j)}: cache {tuple(k.shape)}, expected {L.plane_block} elements a block")
+            self.state_planes.append((k.reshape(k.shape[0], -1), v.reshape(v.shape[0], -1)))
 
     # -- forward --
 
@@ -332,19 +371,15 @@ class Inkling2ForCausalLM(nn.Module):
         T = input_ids.shape[-1] if input_ids.dim() == 1 else input_ids.numel()
         h = self.embed_tokens(input_ids.reshape(-1), scatter_tokens=False, rank=rank)
         h = ops.rms_norm(h, self.embed_norm, c.eps, DTYPE)
-        block_table = md0["block_table_tensor"]
         if is_prefill:
             B, S = 1, T
-            block_table = block_table[:1]
             # the chunk's real tokens: the runner pads a chunk with slot 0 (the null block's first slot)
             valid = (md0["slot_mapping"] > 0).sum().to(torch.int64).view(1)
             reset = (md0["cached_seq_len"].reshape(-1)[:1] > 0).view(1, 1)
         else:
             B, S = T, 1
-            block_table = block_table[:T]
             valid, reset = 1, None
-        io = PagedIO(self, positions.reshape(B, S), block_table, md0["slot_mapping"].reshape(-1),
-                     block_table[:, 0], valid, reset, B, S)
+        io = PagedIO(self, attn_metadata, positions.reshape(B, S), valid, reset, B, S)
         params = {"layers": [l.params() for l in self.layers], "message_query": self.message_query,
                   "final_query": self.final_query, "norm": self.norm}
         h = ops.text_model(params, c, h.view(B, S, -1), io, dense=bool(is_prefill))
