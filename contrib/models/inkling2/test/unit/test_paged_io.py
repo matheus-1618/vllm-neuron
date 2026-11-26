@@ -147,6 +147,7 @@ def metadata(pager, rows, positions, S, decode, n=None):
 
 def model_stub(cfg, caches, names):
     m = types.SimpleNamespace(config=cfg, moe_kernel=False, attn_kernel=False, moe_prefill_kernel=False,
+                              block_end_records=True,
                               tp_group=types.SimpleNamespace(world_size=1))
     m.state_layout = M.StateLayout(cfg, BS)
     m.kv_cache = [caches[M.cache_name(c)] for c in range(cfg.cache_layers)]
@@ -257,3 +258,18 @@ def test_prefix_hit_matches_contiguous(monkeypatch):
     got = torch.cat(out_b, 1)
     dmax = (got - want).abs().max().item()
     assert torch.isfinite(got).all() and dmax < 1e-3 * max(1.0, want.abs().max().item()), dmax
+
+
+def test_layers_sharing_a_buffer_get_one_flat_tensor():
+    """With the hybrid KV cache manager, layers of different groups share a buffer: they must get the same flat
+    tensor object (distinct overlapping views would become a synthetic base written back in full on every write)."""
+    buf = torch.zeros(2 * 4 * 1 * 8 * 16)
+    k, v = buf[:512].view(4, 1, 8, 16), buf[512:].view(4, 1, 8, 16)
+    k2, v2 = buf[:512].view(4, 1, 8, 16), buf[512:].view(4, 1, 8, 16)     # another layer's views of the same buffer
+    shared = {}
+    a = M.Inkling2ForCausalLM._flat_kv(k, v, shared)
+    b = M.Inkling2ForCausalLM._flat_kv(k2, v2, shared)
+    assert a is b and a.numel() == buf.numel()
+    kp, vp = M.Inkling2ForCausalLM._planes((a, (4, 1, 8, 16)))
+    kp[1, 0, 2, 3] = 5.0
+    assert k[1, 0, 2, 3] == 5.0 and vp.data_ptr() == v.data_ptr()

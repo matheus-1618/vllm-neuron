@@ -158,7 +158,7 @@ class PagedIO(ops.LayerIO):
         self.new = {}
         # a prefill chunk also leaves the record at the end of every block it fills (starts are block-aligned: chunks
         # and prefix-cache hits are whole blocks), so a later request whose prefix hits those blocks reads it there
-        self.fills = list(range(1, S // bs + 1)) if S > 1 else []
+        self.fills = list(range(1, S // bs + 1)) if S > 1 and model.block_end_records else []
         self.new_fill = {k: {} for k in self.fills}
 
     def _table(self, name):
@@ -296,9 +296,17 @@ class Inkling2ForCausalLM(nn.Module):
         self.moe_kernel = os.environ.get("INKLING2_NKI_MOE", "1") != "0"
         self.attn_kernel = os.environ.get("INKLING2_NKI_ATTN") == "1"
         self.moe_prefill_kernel = os.environ.get("INKLING2_NKI_MOE_PREFILL") == "1"
-        self.kv_cache = None
+        # the conv-state record at the end of every block a prefill chunk fills: only a prefix-cache hit reads it
+        self.block_end_records = False
+        try:
+            from vllm.config import get_current_vllm_config
+
+            self.block_end_records = bool(get_current_vllm_config().cache_config.enable_prefix_caching)
+        except Exception:  # noqa: BLE001 (no engine config, e.g. host tests)
+            pass
+        self._kv_flat = None
+        self._state_flat = None
         self.state_layout = None
-        self.state_planes = None
         self.block_size = None
         self._capture_block_size()
 
@@ -348,18 +356,53 @@ class Inkling2ForCausalLM(nn.Module):
         layers += [spec(state_name(j), True) for j in range(STATE_LAYERS)]
         return KVSpec(layers=layers)
 
+    @staticmethod
+    def _flat_kv(k, v, shared):
+        """A 1-D tensor over a layer's K and V planes (K then V, adjacent), one object per physical buffer: with the
+        hybrid KV cache manager, layers at one position of different cache groups share a buffer, and distinct
+        overlapping views of it would be merged into a synthetic base the compiler writes back in full on every
+        cache write (the gemma4 contrib's ``_flat_kv``)."""
+        assert v.storage_offset() == k.storage_offset() + k.numel(), "K and V planes must be adjacent"
+        key = (k.untyped_storage().data_ptr(), k.storage_offset(), 2 * k.numel(), k.dtype)
+        if key not in shared:
+            shared[key] = k.as_strided((2 * k.numel(),), (1,), k.storage_offset())
+        return shared[key]
+
     def bind_kv_cache(self, kv_caches: dict) -> None:
         if self.state_layout is None:
             self.get_kv_spec()
-        self.kv_cache = [(kv_caches[cache_name(i)][0], kv_caches[cache_name(i)][1])
-                         for i in range(self.config.cache_layers)]
+        shared: dict = {}
+
+        def flat(name):
+            k, v = kv_caches[name][0], kv_caches[name][1]
+            return self._flat_kv(k, v, shared), tuple(int(x) for x in k.shape)
+
+        self._kv_flat = [flat(cache_name(i)) for i in range(self.config.cache_layers)]
+        self._state_flat = [flat(state_name(j)) for j in range(STATE_LAYERS)]
         L = self.state_layout
-        self.state_planes = []
-        for j in range(STATE_LAYERS):
-            k, v = kv_caches[state_name(j)][0], kv_caches[state_name(j)][1]
-            if k.shape[-3] * k.shape[-2] * k.shape[-1] != L.plane_block:
-                raise ValueError(f"{state_name(j)}: cache {tuple(k.shape)}, expected {L.plane_block} elements a block")
-            self.state_planes.append((k.reshape(k.shape[0], -1), v.reshape(v.shape[0], -1)))
+        for name, (_, shape) in zip([state_name(j) for j in range(STATE_LAYERS)], self._state_flat):
+            if shape[-3] * shape[-2] * shape[-1] != L.plane_block:
+                raise ValueError(f"{name}: cache {shape}, expected {L.plane_block} elements a block")
+
+    @staticmethod
+    def _planes(flat_and_shape):
+        f, shape = flat_and_shape
+        n = f.numel() // 2
+        return f[:n].view(shape), f[n:].view(shape)
+
+    @property
+    def kv_cache(self):
+        """Each cache layer's ``(K, V)`` ``[N, 1, block, d]``: views of its buffer's flat tensor, made per forward."""
+        return [self._planes(x) for x in self._kv_flat]
+
+    @property
+    def state_planes(self):
+        """Each state layer's K and V planes as ``[N, block * d]`` rows (views of the flat tensors)."""
+        out = []
+        for x in self._state_flat:
+            k, v = self._planes(x)
+            out.append((k.reshape(k.shape[0], -1), v.reshape(v.shape[0], -1)))
+        return out
 
     # -- forward --
 
