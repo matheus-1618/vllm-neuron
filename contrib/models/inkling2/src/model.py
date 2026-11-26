@@ -20,6 +20,7 @@ A prefill step is one request's chunk; a decode step is one token per row.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 from torch import nn
@@ -184,7 +185,7 @@ class PagedIO(ops.LayerIO):
         blk, pos = paged_slot_indices(self.md[name]["slot_mapping"].reshape(-1), block, n)
         token = KV.write_kv(flat, k.transpose(1, 2).reshape(-1, d), v.transpose(1, 2).reshape(-1, d), blk, pos, 1, dims)
         table, first = self._table(name)
-        if window is not None and self.S > 1:
+        if window is not None and self.S > 1 and os.environ.get("INKLING2_DBG_SLIDING_FULLREAD") != "1":
             # a sliding layer's prefill chunk reads only the blocks of its window (about S + window keys)
             blocks, first = ops.window_blocks(table, self.positions[:, 0], self.S, window, block)
         else:

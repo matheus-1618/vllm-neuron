@@ -108,7 +108,7 @@ class Pager:
                     if reuse:
                         for t in caches[n]:
                             t[b].normal_(generator=self.g)
-                        self.free.insert(0, b)
+                        self.free.append(b)       # reused by the next allocation (any group)
                     self.orig.setdefault(n, {})[i] = b
                     self.tables[n][i] = 0
 
@@ -166,8 +166,27 @@ def logits(prm, cfg, ids, io, dense):
     return ops.text_model(prm, cfg, h, io, dense)
 
 
-@pytest.mark.parametrize("pad_row", [False, True])
-def test_paged_io_matches_contiguous(pad_row, monkeypatch):
+def hma_layout(cfg, names, sliding, g):
+    """As vLLM's hybrid manager lays the caches out: groups of ``n_full`` layers (the full layers one group, the
+    sliding ones in order), one block table a group, and layers at one position of different groups sharing a
+    buffer. Returns (caches, pager) with each name's table the group's (one list object)."""
+    full = [n for n in names if not sliding[n]]
+    slid = [n for n in names if sliding[n]]
+    gs = len(full)
+    groups = [full] + [slid[i:i + gs] for i in range(0, len(slid), gs)]
+    d = cfg.head_dim
+    bufs = [torch.zeros(2, NBLK, 1, BS, d) for _ in range(gs)]
+    caches = {n: tuple(bufs[i].unbind(0)) for grp in groups for i, n in enumerate(grp)}
+    pager = Pager(cfg, names, sliding, g)
+    for grp in groups:
+        t = []
+        for n in grp:
+            pager.tables[n] = t
+    return caches, pager
+
+
+@pytest.mark.parametrize("pad_row,hma", [(False, False), (True, False), (False, True)])
+def test_paged_io_matches_contiguous(pad_row, hma, monkeypatch):
     monkeypatch.setattr(M, "DTYPE", torch.float32)     # the state record in fp32, as the contiguous reference keeps it
     torch.manual_seed(0)
     g = torch.Generator().manual_seed(1)
@@ -177,12 +196,16 @@ def test_paged_io_matches_contiguous(pad_row, monkeypatch):
     sliding = {M.cache_name(c): not cfg.is_full(cfg.cache_layer_model(c)) for c in range(cfg.cache_layers)}
     sliding.update({M.state_name(j): True for j in range(M.STATE_LAYERS)})
     d = cfg.head_dim
-    caches = {n: tuple(torch.zeros(2, NBLK, 1, BS, d).unbind(0)) for n in names}
+    if hma:
+        caches, pager = hma_layout(cfg, names, sliding, g)
+    else:
+        caches = {n: tuple(torch.zeros(2, NBLK, 1, BS, d).unbind(0)) for n in names}
     stub = model_stub(cfg, caches, names)
     ref = ContiguousIO(cfg)
     T, chunk, n_dec = 160, 32, 24          # 5 prefill chunks (2.5 windows), then decode steps
     ids = torch.randint(0, 1000, (1, T + n_dec), generator=g)
-    pager = Pager(cfg, names, sliding, g)
+    if not hma:
+        pager = Pager(cfg, names, sliding, g)
     out_p, out_r = [], []
     with torch.no_grad():
         for t0 in range(0, T, chunk):
