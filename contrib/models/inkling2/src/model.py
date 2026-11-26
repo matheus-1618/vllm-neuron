@@ -156,6 +156,10 @@ class PagedIO(ops.LayerIO):
             rec = rec * reset.to(rec.dtype)
         self.rec = rec
         self.new = {}
+        # a prefill chunk also leaves the record at the end of every block it fills (starts are block-aligned: chunks
+        # and prefix-cache hits are whole blocks), so a later request whose prefix hits those blocks reads it there
+        self.fills = list(range(1, S // bs + 1)) if S > 1 else []
+        self.new_fill = {k: {} for k in self.fills}
 
     def _table(self, name):
         """The layer's block table (rows of this step) and the position of its first block's first key."""
@@ -198,6 +202,8 @@ class PagedIO(ops.LayerIO):
 
     def put_window(self, c, slot, seq):
         self.new[(c, slot)] = ops.next_window(seq, self.valid).to(DTYPE)
+        for k in self.fills:
+            self.new_fill[k][(c, slot)] = ops.next_window(seq, k * self.m.state_layout.block_size).to(DTYPE)
 
     def moe_decode(self, x, idx, w, gate_up, down):
         """The decode MoE: the NKI kernel (kernels/moe_decode_hw.py) unless INKLING2_NKI_MOE=0, else torch."""
@@ -226,17 +232,28 @@ class PagedIO(ops.LayerIO):
         tp = self.m.tp_group
         return tp.all_reduce(x) if tp.world_size > 1 else x
 
-    def publish(self):
-        """Write every new window to the block of the step's last token (padding rows go to the null block)."""
+    def _write_record(self, windows, blk):
         L = self.m.state_layout
-        parts = [self.new[(c, s)].reshape(self.B, -1) for c in range(self.m.config.cache_layers) for s in range(4)]
+        parts = [windows[(c, s)].reshape(self.B, -1) for c in range(self.m.config.cache_layers) for s in range(4)]
         rec = torch.cat(parts, dim=1)
         rec = torch.cat([rec, rec.new_zeros(self.B, 2 * STATE_LAYERS * L.plane_block - L.total)], dim=1)
         for j in range(STATE_LAYERS):
-            blk = self._block_of(state_name(j), self.write_pos, L.block_size)
             kp, vp = self.m.state_planes[j]
-            kp.index_copy_(0, blk, rec[:, (2 * j) * L.plane_block:(2 * j + 1) * L.plane_block])
-            vp.index_copy_(0, blk, rec[:, (2 * j + 1) * L.plane_block:(2 * j + 2) * L.plane_block])
+            kp.index_copy_(0, blk[j], rec[:, (2 * j) * L.plane_block:(2 * j + 1) * L.plane_block])
+            vp.index_copy_(0, blk[j], rec[:, (2 * j + 1) * L.plane_block:(2 * j + 2) * L.plane_block])
+
+    def publish(self):
+        """Write the new windows to the block of the step's last token, and in prefill also the windows at the end of
+        each block the chunk filled to that block (padding rows and blocks the chunk did not fill go to the null
+        block)."""
+        bs = self.m.state_layout.block_size
+        names = [state_name(j) for j in range(STATE_LAYERS)]
+        for k in self.fills:
+            end = self.positions[:, 0] + k * bs - 1
+            ok = (k * bs <= self.valid) & (self.positions[:, 0] % bs == 0)
+            blk = [torch.where(ok, self._block_of(n, end, bs), torch.zeros_like(end)) for n in names]
+            self._write_record(self.new_fill[k], blk)
+        self._write_record(self.new, [self._block_of(n, self.write_pos, bs) for n in names])
 
 
 class Inkling2ForCausalLM(nn.Module):

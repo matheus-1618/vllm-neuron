@@ -87,6 +87,7 @@ class Pager:
     def __init__(self, cfg, names, sliding, g):
         self.cfg, self.names, self.sliding, self.g = cfg, names, sliding, g
         self.tables = {n: [] for n in names}
+        self.orig = {}              # freed blocks' ids (still in the prefix cache unless reused)
         self.free = list(torch.randperm(NBLK - 1, generator=g).add(1).tolist())   # block 0 is the null block
 
     def grow(self, n_tokens):
@@ -94,9 +95,9 @@ class Pager:
             while len(self.tables[n]) * BS < n_tokens:
                 self.tables[n].append(self.free.pop())
 
-    def release(self, n_computed, caches):
-        """vLLM frees a sliding layer's blocks whose tokens all precede ``n_computed - window + 1``; another request
-        then writes them (here: noise)."""
+    def release(self, n_computed, caches, reuse=True):
+        """vLLM frees a sliding layer's blocks whose tokens all precede ``n_computed - window + 1``; with ``reuse``
+        another request then writes them (here: noise), else they stay in the prefix cache as they are."""
         keep_from = max(0, n_computed - self.cfg.window + 1)
         for n in self.names:
             if not self.sliding[n]:
@@ -104,28 +105,32 @@ class Pager:
             for i in range(keep_from // BS):
                 b = self.tables[n][i]
                 if b:
-                    for t in caches[n]:
-                        t[b].normal_(generator=self.g)
-                    self.free.insert(0, b)
+                    if reuse:
+                        for t in caches[n]:
+                            t[b].normal_(generator=self.g)
+                        self.free.insert(0, b)
+                    self.orig.setdefault(n, {})[i] = b
                     self.tables[n][i] = 0
 
 
-def metadata(pager, rows, positions, S, decode):
-    """attn_metadata for ``rows`` (a list of (pager or None for a padding row)) at ``positions [B]``."""
+def metadata(pager, rows, positions, S, decode, n=None):
+    """attn_metadata for ``rows`` (a list of (pager or None for a padding row)) at ``positions [B]``; tokens past
+    ``n`` of a prefill chunk are padding (slot 0)."""
+    n = S if n is None else n
     md = {}
-    for n in pager.names:
-        width = max(len(p.tables[n]) for p in rows if p is not None)
-        if decode and pager.sliding[n]:
+    for name_ in pager.names:
+        width = max(len(p.tables[name_]) for p in rows if p is not None)
+        if decode and pager.sliding[name_]:
             nb = pager.cfg.window // BS + 1
         table, slots, offs = [], [], []
         for b, p in enumerate(rows):
             q = int(positions[b])
             if p is None:
-                row, sl, off = [-1] * (nb if decode and pager.sliding[n] else width), [0] * S, 0
+                row, sl, off = [-1] * (nb if decode and pager.sliding[name_] else width), [0] * S, 0
             else:
-                full = p.tables[n] + [-1] * (width - len(p.tables[n]))
-                sl = [p.tables[n][(q + s) // BS] * BS + (q + s) % BS for s in range(S)]
-                if decode and pager.sliding[n]:
+                full = p.tables[name_] + [-1] * (width - len(p.tables[name_]))
+                sl = [p.tables[name_][(q + s) // BS] * BS + (q + s) % BS if s < n else 0 for s in range(S)]
+                if decode and pager.sliding[name_]:
                     start = max(0, q // BS - nb + 1)
                     row = [full[start + i] if start + i < len(full) else -1 for i in range(nb)]
                     off = start * BS
@@ -134,9 +139,9 @@ def metadata(pager, rows, positions, S, decode):
             table.append(row)
             slots += sl
             offs.append(off)
-        md[n] = {"block_table_tensor": torch.tensor(table), "slot_mapping": torch.tensor(slots)}
-        if decode and pager.sliding[n]:
-            md[n]["swa_kv_pos_offset"] = torch.tensor(offs, dtype=torch.int32)
+        md[name_] = {"block_table_tensor": torch.tensor(table), "slot_mapping": torch.tensor(slots)}
+        if decode and pager.sliding[name_]:
+            md[name_]["swa_kv_pos_offset"] = torch.tensor(offs, dtype=torch.int32)
     return md
 
 
@@ -197,3 +202,58 @@ def test_paged_io_matches_contiguous(pad_row, monkeypatch):
     a, b = torch.cat(out_p, 1), torch.cat(out_r, 1)
     dmax = (a - b).abs().max().item()
     assert torch.isfinite(a).all() and dmax < 1e-3 * max(1.0, b.abs().max().item()), dmax
+
+
+def test_prefix_hit_matches_contiguous(monkeypatch):
+    """Request B shares request A's first 3 blocks (a prefix-cache hit; A's sliding blocks out of the window already
+    freed) while A went on to 128, and continues from position 96: its logits match a contiguous run of B's whole sequence. This needs the
+    state record at the end of every block a prefill chunk fills."""
+    monkeypatch.setattr(M, "DTYPE", torch.float32)
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(2)
+    cfg = tiny()
+    prm = params(cfg, g)
+    names = [M.cache_name(c) for c in range(cfg.cache_layers)] + [M.state_name(j) for j in range(M.STATE_LAYERS)]
+    sliding = {M.cache_name(c): not cfg.is_full(cfg.cache_layer_model(c)) for c in range(cfg.cache_layers)}
+    sliding.update({M.state_name(j): True for j in range(M.STATE_LAYERS)})
+    d = cfg.head_dim
+    caches = {n: (torch.zeros(NBLK, 1, BS, d), torch.zeros(NBLK, 1, BS, d)) for n in names}
+    stub = model_stub(cfg, caches, names)
+    P, chunk, T, n_dec = 96, 64, 160, 8
+    ids = torch.randint(0, 1000, (1, T + n_dec), generator=g)
+    a = Pager(cfg, names, sliding, g)
+
+    def prefill(pager, t0, n, reuse=True):
+        pager.grow(t0 + n)
+        pos = torch.tensor([t0])
+        S = chunk
+        io = M.PagedIO(stub, metadata(pager, [pager], pos, S, False, n), pos.view(1, 1) + torch.arange(S),
+                       torch.tensor([n]), (torch.tensor([[t0]]) > 0), 1, S)
+        tok = ids[:, t0:t0 + S] if t0 + S <= ids.shape[1] else None
+        out = logits(prm, cfg, tok, io, True)
+        io.publish()
+        pager.release(t0 + n, caches, reuse)
+        return out[:, :n]
+
+    with torch.no_grad():
+        prefill(a, 0, 64, reuse=False)
+        prefill(a, 64, 64, reuse=False)   # block 2 ends inside this chunk (position 95): only its block-end record has it
+        b = Pager(cfg, names, sliding, g)
+        b.free = a.free
+        first_needed = max(0, P - cfg.window + 1) // BS      # B's sliding layers need the blocks of its window only
+        for n in names:
+            ids_ = [a.orig.get(n, {}).get(i, a.tables[n][i]) for i in range(P // BS)]
+            b.tables[n] = [0 if sliding[n] and i < first_needed else x for i, x in enumerate(ids_)]
+        out_b = [prefill(b, P, 64)]
+        for t in range(P + 64, T + n_dec):
+            b.grow(t + 1)
+            pos = torch.tensor([t])
+            io = M.PagedIO(stub, metadata(b, [b], pos, 1, True), pos.view(1, 1), 1, None, 1, 1)
+            out_b.append(logits(prm, cfg, ids[:, t:t + 1], io, False)); io.publish()
+            b.release(t + 1, caches)
+        ref = ContiguousIO(cfg)
+        ref.positions = torch.arange(T + n_dec).view(1, -1)
+        want = logits(prm, cfg, ids, ref, True)[:, P:]
+    got = torch.cat(out_b, 1)
+    dmax = (got - want).abs().max().item()
+    assert torch.isfinite(got).all() and dmax < 1e-3 * max(1.0, want.abs().max().item()), dmax

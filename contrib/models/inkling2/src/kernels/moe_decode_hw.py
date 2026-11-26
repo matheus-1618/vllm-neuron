@@ -16,7 +16,7 @@ Per token ``t`` and routed slot ``k`` (expert ``e``, routing weight ``r``)::
 
 Inputs (HBM): ``x [T, H]`` bf16, ``idx [1, T * K]`` int32 (row-major ``[T, K]``), ``w [1, T * K]`` fp32,
 ``gate_up [E, H, 2 I_r]`` bf16 (``[in, out]``, gate then up), ``down [E, I_r, H]`` bf16. Output ``[T, H]`` fp32
-(this rank's partial sum). ``H`` a multiple of 128, ``2 I_r <= 512``, ``T <= 4``. An expert id ``>= E`` (a padding
+(this rank's partial sum). ``H`` a multiple of 128, ``2 I_r <= 512``; tokens in groups of 4. An expert id ``>= E`` (a padding
 row) skips that expert's weight loads (``oob_mode=skip``); the row's output is then not meaningful.
 """
 
@@ -29,6 +29,7 @@ P = 128
 N_TILE = 512          # PSUM bank: 512 fp32 a partition
 ROW = 32              # PSUM partition of token t: t * ROW (matmul column tiling of 32)
 RING = 4              # expert weight buffers in flight
+GROUP = 4             # tokens a PSUM group (4 strips of 32 partitions)
 
 try:
     import nki
@@ -57,7 +58,6 @@ try:
         gu_view = gate_up.reshape((E, P, H1 * I2))          # partition p: rows p * H1 .. p * H1 + H1 - 1
         n_tiles = [(c * N_TILE, min(N_TILE, H - c * N_TILE)) for c in range((H + N_TILE - 1) // N_TILE)]
         i_parts = [(s, min(P, I - s)) for s in range(0, I, P)]
-        y_ps = [nl.ndarray((T * ROW, N_TILE), dtype=nl.float32, buffer=nl.psum) for _ in n_tiles]
 
         wgu = [nl.ndarray((P, H1 * I2), dtype=gate_up.dtype, buffer=nl.sbuf) for _ in range(RING)]
         wd = [[nl.ndarray((P, H), dtype=down.dtype, buffer=nl.sbuf) for _ in i_parts] for _ in range(RING)]
@@ -69,58 +69,61 @@ try:
             for t_ in wd[r]:
                 nisa.memset(dst=t_, value=0.0)
 
-        for t in range(T):
-            for k in range(K):
-                n = t * K + k
-                slot = n % RING
-                reg = nisa.register_alloc()
-                nisa.register_load(reg, idx_sb[0:1, n:n + 1])
-                nisa.dma_copy(dst=wgu[slot], src=gu_view.select(0, reg), dge_mode=nisa.dge_mode.hwdge,
-                              oob_mode=nisa.oob_mode.skip)
-                d_e = down.select(0, reg)                     # [I, H]
-                for pi, (s, sz) in enumerate(i_parts):
-                    nisa.dma_copy(dst=wd[slot][pi][0:sz, :], src=d_e[s:s + sz, :], dge_mode=nisa.dge_mode.hwdge,
+        # tokens in groups of GROUP (a token's sums take a 32-partition strip of a PSUM bank), the banks reused
+        for g0 in range(0, T, GROUP):
+            y_ps = [nl.ndarray((GROUP * ROW, N_TILE), dtype=nl.float32, buffer=nl.psum) for _ in n_tiles]
+            for t in range(g0, min(g0 + GROUP, T)):
+                for k in range(K):
+                    n = t * K + k
+                    slot = n % RING
+                    reg = nisa.register_alloc()
+                    nisa.register_load(reg, idx_sb[0:1, n:n + 1])
+                    nisa.dma_copy(dst=wgu[slot], src=gu_view.select(0, reg), dge_mode=nisa.dge_mode.hwdge,
                                   oob_mode=nisa.oob_mode.skip)
-
-                # gate / up of this token: [1, 2I] in PSUM, accumulated over the H1 hidden blocks
-                gu_ps = nl.ndarray((1, I2), dtype=nl.float32, buffer=nl.psum)
-                for j in range(H1):
-                    nisa.nc_matmul(dst=gu_ps, stationary=xT[:, t, j:j + 1],
-                                   moving=wgu[slot][:, j * I2:(j + 1) * I2], accumulate=(j > 0))
-                sig = nl.ndarray((1, I), dtype=nl.float32, buffer=nl.sbuf)
-                g = nl.ndarray((1, I), dtype=nl.float32, buffer=nl.sbuf)
-                u = nl.ndarray((1, I), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.activation(dst=sig, op=nl.sigmoid, data=gu_ps[0:1, 0:I])
-                nisa.activation(dst=g, op=nl.tanh, data=gu_ps[0:1, 0:I], scale=1.0 / GATE_CAP)
-                nisa.tensor_tensor(dst=g, data1=g, data2=sig, op=nl.multiply)
-                nisa.activation(dst=u, op=nl.tanh, data=gu_ps[0:1, I:I2], scale=1.0 / UP_CAP)
-                # u * (GATE_CAP * UP_CAP) * routing weight
-                nisa.tensor_scalar(dst=u, data=u, op0=nl.multiply, operand0=GATE_CAP * UP_CAP,
-                                   op1=nl.multiply, operand1=w_sb[0:1, n:n + 1])
-                a = nl.ndarray((1, I), dtype=down.dtype, buffer=nl.sbuf)
-                nisa.tensor_tensor(dst=a, data1=g, data2=u, op=nl.multiply)
-
-                # a^T on partitions (the down projection contracts over I)
-                aT = []
-                for s, sz in i_parts:
-                    tp = nl.ndarray((sz, 1), dtype=down.dtype, buffer=nl.psum)
-                    nisa.nc_transpose(dst=tp, data=a[0:1, s:s + sz])
-                    sb = nl.ndarray((sz, 1), dtype=down.dtype, buffer=nl.sbuf)
-                    nisa.tensor_copy(dst=sb, src=tp)
-                    aT.append(sb)
-
-                for c, (n0, nsz) in enumerate(n_tiles):
+                    d_e = down.select(0, reg)                     # [I, H]
                     for pi, (s, sz) in enumerate(i_parts):
-                        first = k == 0 and pi == 0
-                        nisa.nc_matmul(dst=y_ps[c][t * ROW:t * ROW + 1, 0:nsz], stationary=aT[pi][0:sz, 0:1],
-                                       moving=wd[slot][pi][0:sz, n0:n0 + nsz], accumulate=not first,
-                                       tile_position=(0, t * ROW), tile_size=(P, ROW))
+                        nisa.dma_copy(dst=wd[slot][pi][0:sz, :], src=d_e[s:s + sz, :], dge_mode=nisa.dge_mode.hwdge,
+                                      oob_mode=nisa.oob_mode.skip)
 
-        for t in range(T):
-            row = nl.ndarray((1, H), dtype=nl.float32, buffer=nl.sbuf)
-            for c, (n0, nsz) in enumerate(n_tiles):
-                nisa.tensor_copy(dst=row[0:1, n0:n0 + nsz], src=y_ps[c][t * ROW:t * ROW + 1, 0:nsz])
-            nisa.dma_copy(dst=out[t:t + 1, :], src=row)
+                    # gate / up of this token: [1, 2I] in PSUM, accumulated over the H1 hidden blocks
+                    gu_ps = nl.ndarray((1, I2), dtype=nl.float32, buffer=nl.psum)
+                    for j in range(H1):
+                        nisa.nc_matmul(dst=gu_ps, stationary=xT[:, t, j:j + 1],
+                                       moving=wgu[slot][:, j * I2:(j + 1) * I2], accumulate=(j > 0))
+                    sig = nl.ndarray((1, I), dtype=nl.float32, buffer=nl.sbuf)
+                    g = nl.ndarray((1, I), dtype=nl.float32, buffer=nl.sbuf)
+                    u = nl.ndarray((1, I), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.activation(dst=sig, op=nl.sigmoid, data=gu_ps[0:1, 0:I])
+                    nisa.activation(dst=g, op=nl.tanh, data=gu_ps[0:1, 0:I], scale=1.0 / GATE_CAP)
+                    nisa.tensor_tensor(dst=g, data1=g, data2=sig, op=nl.multiply)
+                    nisa.activation(dst=u, op=nl.tanh, data=gu_ps[0:1, I:I2], scale=1.0 / UP_CAP)
+                    # u * (GATE_CAP * UP_CAP) * routing weight
+                    nisa.tensor_scalar(dst=u, data=u, op0=nl.multiply, operand0=GATE_CAP * UP_CAP,
+                                       op1=nl.multiply, operand1=w_sb[0:1, n:n + 1])
+                    a = nl.ndarray((1, I), dtype=down.dtype, buffer=nl.sbuf)
+                    nisa.tensor_tensor(dst=a, data1=g, data2=u, op=nl.multiply)
+
+                    # a^T on partitions (the down projection contracts over I)
+                    aT = []
+                    for s, sz in i_parts:
+                        tp = nl.ndarray((sz, 1), dtype=down.dtype, buffer=nl.psum)
+                        nisa.nc_transpose(dst=tp, data=a[0:1, s:s + sz])
+                        sb = nl.ndarray((sz, 1), dtype=down.dtype, buffer=nl.sbuf)
+                        nisa.tensor_copy(dst=sb, src=tp)
+                        aT.append(sb)
+
+                    for c, (n0, nsz) in enumerate(n_tiles):
+                        for pi, (s, sz) in enumerate(i_parts):
+                            first = k == 0 and pi == 0
+                            nisa.nc_matmul(dst=y_ps[c][(t - g0) * ROW:(t - g0) * ROW + 1, 0:nsz], stationary=aT[pi][0:sz, 0:1],
+                                           moving=wd[slot][pi][0:sz, n0:n0 + nsz], accumulate=not first,
+                                           tile_position=(0, (t - g0) * ROW), tile_size=(P, ROW))
+
+            for t in range(g0, min(g0 + GROUP, T)):
+                row = nl.ndarray((1, H), dtype=nl.float32, buffer=nl.sbuf)
+                for c, (n0, nsz) in enumerate(n_tiles):
+                    nisa.tensor_copy(dst=row[0:1, n0:n0 + nsz], src=y_ps[c][(t - g0) * ROW:(t - g0) * ROW + 1, 0:nsz])
+                nisa.dma_copy(dst=out[t:t + 1, :], src=row)
         return out
 except ImportError:  # pragma: no cover
     inkling2_moe_decode_hw = None

@@ -32,7 +32,7 @@ def _moe_inputs(T, seed=0):
     return x, idx, w, gate_up, down
 
 
-@pytest.mark.parametrize("T", [1, 2])
+@pytest.mark.parametrize("T", [1, 2, 8])
 def test_moe_decode_hw_matches_gather(T):
     x, idx, w, gate_up, down = _moe_inputs(T)
     ref = ops.moe_gather(x, idx, w, gate_up, down, 4.0, 25.0)
