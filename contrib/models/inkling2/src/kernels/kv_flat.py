@@ -4,6 +4,8 @@
 Copied from the gemma4 contrib's ``kv_write.py`` (same kernels and wrappers): with vLLM's hybrid KV cache manager,
 cache layers of different groups share a physical buffer, and a torch op that writes or reads a view of it makes
 the compiler copy the whole buffer per access (gemma4's README). Here 72 cache layers sit on 8 shared buffers.
+One change: the row index goes to the kernels tile-major (``[tiles, 128]``) and the kernels load it transposed, so no
+torch transpose of the index reaches the compiler.
 """
 import torch
 import torch.nn.functional as F
@@ -34,14 +36,14 @@ def _kv_rows_write_kernel(pool, rows, row_index):
     Args:
         pool: HBM cache ``[..., width]`` (any leading shape), bf16 or FP8.
         rows: ``[128 * T, width]`` rows in the dtype of ``pool``.
-        row_index: ``[128, T]`` int32 row numbers. An index outside ``[0, R)``
+        row_index: ``[T, 128]`` int32 row numbers (tile-major; the kernel loads them transposed). An index outside ``[0, R)``
             writes nothing, which is how padding rows (and negative slots) are skipped.
 
     Returns:
         ``(pool, done)``: ``pool`` with the rows written (alias of the input) and a ``[128, 1]``
         zero token that completes after the writes.
     """
-    parts, tiles = row_index.shape
+    tiles, parts = row_index.shape
     width = rows.shape[1]
     total = 1
     for size in pool.shape:
@@ -59,7 +61,8 @@ def _kv_rows_write_kernel(pool, rows, row_index):
     idx = nl.ndarray(
         (_TILE, tiles), dtype=nl.int32, buffer=nl.sbuf, name="kvw_idx", address=(0, _SBUF_BASE)
     )
-    nisa.dma_copy(dst=idx, src=row_index)
+    # [tiles, 128] in HBM -> [128, tiles] in SBUF: the transpose by the DMA's access pattern, not by a torch op
+    nisa.dma_copy(dst=idx, src=row_index.ap(pattern=[[1, _TILE], [_TILE, tiles]], offset=0))
     n_buf = min(2, tiles)
     ats = [
         nl.ndarray(
@@ -120,7 +123,7 @@ def _kv_rows_gather_kernel(pool, row_index, after, width: int):
     ``after`` is a ``[128, 1]`` int32 token: the kernel adds 0 * after to every index, so it
     cannot start before the kernel that produced ``after`` (a cache write) has finished.
     """
-    parts, tiles = row_index.shape
+    tiles, parts = row_index.shape
     total = 1
     for size in pool.shape:
         total *= int(size)
@@ -136,7 +139,8 @@ def _kv_rows_gather_kernel(pool, row_index, after, width: int):
     idx = nl.ndarray(
         (_TILE, tiles), dtype=nl.int32, buffer=nl.sbuf, name="kvg_idx", address=(0, _SBUF_BASE)
     )
-    nisa.dma_copy(dst=idx, src=row_index)
+    # [tiles, 128] in HBM -> [128, tiles] in SBUF: the transpose by the DMA's access pattern, not by a torch op
+    nisa.dma_copy(dst=idx, src=row_index.ap(pattern=[[1, _TILE], [_TILE, tiles]], offset=0))
     edge = nl.ndarray(
         (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name="kvg_edge", address=(0, at_base + 128)
     )
@@ -215,7 +219,7 @@ def write_kv(flat, k_rows, v_rows, block_idx, pos_idx, num_kv_heads, dims):
     pad = tiles * _TILE - n
     # Padding rows get an out-of-range index, so the kernel skips them.
     index = F.pad(rows, (0, pad), value=flat.numel() // head_dim).to(torch.int32)
-    index = index.view(tiles, _TILE).t().contiguous()
+    index = index.view(tiles, _TILE).contiguous()
     grid = 1 if envs.VLLM_NEURON_CPU_MODE else get_logical_nc_config()
     _, token = wrap_nki(_kv_rows_write_kernel)[grid](
         pool=flat, rows=F.pad(values, (0, 0, 0, pad)), row_index=index
@@ -247,7 +251,7 @@ def gather_kv(flat, block_ids, dims, after=None):
     n = rows.shape[0]
     tiles = -(-n // _TILE)
     index = F.pad(rows, (0, tiles * _TILE - n), value=0).to(torch.int32)
-    index = index.view(tiles, _TILE).t().contiguous()
+    index = index.view(tiles, _TILE).contiguous()
     grid = 1 if envs.VLLM_NEURON_CPU_MODE else get_logical_nc_config()
     if after is None:
         after = _no_token(flat)
