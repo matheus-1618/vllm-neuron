@@ -31,7 +31,7 @@ import torch
 GATE_CAP, UP_CAP = 4.0, 25.0
 P = 128
 TT = 32               # rows a tile
-U = 4                 # tiles an iteration (one's loads overlap another's compute)
+U = int(__import__("os").environ.get("INKLING2_K6_U", "4"))   # tiles an iteration (loads overlap compute)
 N_TILE = 512
 
 try:
