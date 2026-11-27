@@ -99,10 +99,21 @@ def _kv_rows_write_kernel(pool, rows, row_index):
         )
     # A zero token that exists only once the kernel has run: a later kernel that consumes it
     # starts after every row above is written (ordering without reading the cache alias).
-    zero = nl.ndarray(
-        (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name="kvw_zero"
+    # The token must depend on the written rows, not only on the indices: read the last tile's rows back from the
+    # pool (a read after the write of the same HBM tensor) and fold them to zero (x == x is 0 or 1, NaN safe).
+    last = ats[(tiles - 1) % 2]
+    rb = nl.ndarray((_TILE, width), dtype=rows.dtype, buffer=nl.sbuf, name="kvw_rb")
+    nisa.dma_copy(
+        dst=rb,
+        src=view.ap(pattern=[[width, _TILE], [1, width]], offset=0, vector_offset=last[0:_TILE, 0:1], indirect_dim=0),
+        oob_mode=nisa.oob_mode.skip,
     )
-    nisa.tensor_scalar(dst=zero, data=idx[0:_TILE, 0:1], op0=nl.multiply, operand0=0)
+    rbf = nl.ndarray((_TILE, 1), dtype=nl.float32, buffer=nl.sbuf, name="kvw_rbf")
+    nisa.tensor_copy(dst=rbf, src=rb[0:_TILE, 0:1])
+    nisa.tensor_tensor(dst=rbf, data1=rbf, data2=rbf, op=nl.equal)
+    nisa.tensor_scalar(dst=rbf, data=rbf, op0=nl.multiply, operand0=0.0)
+    zero = nl.ndarray((_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name="kvw_zero")
+    nisa.tensor_copy(dst=zero, src=rbf)
     nisa.dma_copy(dst=done, src=zero)
     return pool, done
 
