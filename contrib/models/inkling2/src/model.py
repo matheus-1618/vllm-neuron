@@ -183,9 +183,13 @@ class PagedIO(ops.LayerIO):
 
     @property
     def moe_prefill(self):
-        """The grouped NKI prefill MoE (kernels/moe_prefill_grouped.py), opt-in with INKLING2_NKI_MOE_PREFILL=1."""
+        """An NKI prefill MoE, opt-in: INKLING2_NKI_MOE_PREFILL=grouped (or 1; kernels/moe_prefill_grouped.py) or
+        =tiles (kernels/moe_prefill_tiles.py)."""
         if not self.m.moe_prefill_kernel:
             return None
+        if self.m.moe_prefill_kernel == "tiles":
+            from .kernels import moe_prefill_tiles as K6
+            return lambda x, idx, w, gate_up, down: K6.moe_prefill(_nki, x, idx, w, gate_up, down)
         from .kernels import moe_prefill_grouped as K5
         return lambda x, idx, w, gate_up, down: K5.moe_prefill(_nki, x, idx, w, gate_up, down)
 
@@ -251,7 +255,8 @@ class Inkling2ForCausalLM(nn.Module):
         self.moe_kernel = os.environ.get("INKLING2_NKI_MOE", "1") != "0"
         self.moe_kernel_rows = int(os.environ.get("INKLING2_NKI_MOE_ROWS", "2"))
         self.attn_kernel = os.environ.get("INKLING2_NKI_ATTN") == "1"
-        self.moe_prefill_kernel = os.environ.get("INKLING2_NKI_MOE_PREFILL") == "1"
+        self.moe_prefill_kernel = {"1": "grouped", "grouped": "grouped", "tiles": "tiles"}.get(
+            os.environ.get("INKLING2_NKI_MOE_PREFILL", ""))
         self.kv_cache = None
         self.state_layout = None
         self.state_planes = None
