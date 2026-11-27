@@ -168,11 +168,17 @@ class PagedIO(ops.LayerIO):
 
     def moe_decode(self, x, idx, w, gate_up, down):
         """The decode MoE: the NKI kernel (kernels/moe_decode_hw.py) unless INKLING2_NKI_MOE=0, else torch."""
-        # the kernel for buckets of up to 2 rows (unrolled over each row's 8 experts, an 8-row decode graph of 48
-        # visits took the compiler past the host's memory); larger buckets run the torch MoE
-        if self.m.moe_kernel and x.shape[0] <= 2:
+        # the kernel for buckets of up to INKLING2_NKI_MOE_ROWS rows (default 2), in calls of up to 4 rows (the
+        # kernel's PSUM layout); it is unrolled over each row's 8 experts, and an 8-row decode graph of 48 visits in
+        # one call took the compiler past the host's memory. Larger buckets run the torch MoE.
+        T = x.shape[0]
+        if self.m.moe_kernel and T <= self.m.moe_kernel_rows:
             from .kernels import moe_decode_hw as K2
-            return K2.moe_decode_hw(_nki, x, idx, w, gate_up, down, self.valid_rows)
+            if T <= 4:
+                return K2.moe_decode_hw(_nki, x, idx, w, gate_up, down, self.valid_rows)
+            v = self.valid_rows
+            return torch.cat([K2.moe_decode_hw(_nki, x[r:r + 4], idx[r:r + 4], w[r:r + 4], gate_up, down,
+                                               None if v is None else v[r:r + 4]) for r in range(0, T, 4)])
         return ops.moe_gather(x, idx, w, gate_up, down, self.m.config.gate_cap, self.m.config.up_cap)
 
     @property
@@ -243,6 +249,7 @@ class Inkling2ForCausalLM(nn.Module):
         import os
 
         self.moe_kernel = os.environ.get("INKLING2_NKI_MOE", "1") != "0"
+        self.moe_kernel_rows = int(os.environ.get("INKLING2_NKI_MOE_ROWS", "2"))
         self.attn_kernel = os.environ.get("INKLING2_NKI_ATTN") == "1"
         self.moe_prefill_kernel = os.environ.get("INKLING2_NKI_MOE_PREFILL") == "1"
         self.kv_cache = None
