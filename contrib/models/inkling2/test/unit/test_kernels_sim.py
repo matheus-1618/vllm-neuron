@@ -115,3 +115,22 @@ def test_moe_prefill_tiles_matches_dense(T, E_):
     ref = ops.moe_dense(x, idx, w, gate_up, down, 4.0, 25.0, group=min(E_, 32))
     out = K6.moe_prefill(lambda k_: (lambda *a: torch.as_tensor(nki.simulate(k_)(*a))), x, idx, w, gate_up, down)
     assert (out - ref).abs().max() <= 1e-2 * ref.abs().max()
+
+
+@pytest.mark.parametrize("S,E,L,q0,kv0", [(256, 1024, 1536, 5000, 3840), (256, 1024, 2048, 1024, 0),
+                                          (128, 256, 640, 100, 0)])
+def test_rel_shift_matches_ops(S, E, L, q0, kv0):
+    import torch.nn.functional as F_
+    from inkling2_neuron.kernels import rel_shift as KS
+
+    g = torch.Generator().manual_seed(6)
+    h = 3
+    rel = torch.randn(1, h, S, E, generator=g).bfloat16()
+    qs, ks = torch.tensor([q0]), torch.tensor([kv0])
+    ref = ops.relative_bias_shift(rel, qs, L, E, ks)
+    f = torch.flip(rel, dims=[-1])
+    f = F_.pad(f, (0, S)).reshape(1, h, S * (E + S))[..., :S * (E + S - 1)].view(1, h, S, E + S - 1)
+    f = F_.pad(f, (0, 1)).reshape(h * S, E + S)
+    fp, start = KS.prepare(f, ks - qs + E - 1, L)
+    out = torch.as_tensor(nki.simulate(KS.inkling2_rel_shift)(fp, start, L)).view(1, h, S, L)
+    assert torch.equal(out.float(), ref.float())
