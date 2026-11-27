@@ -148,6 +148,10 @@ def relative_bias(rel_logits: torch.Tensor, dist: torch.Tensor, extent: int) -> 
     return torch.where(keep, bias, torch.zeros((), dtype=bias.dtype, device=bias.device))
 
 
+# INKLING2_ONEHOT_SHIFT=1: the prefill's relative shift as a one-hot matmul (experimental)
+ONEHOT_SHIFT = __import__("os").environ.get("INKLING2_ONEHOT_SHIFT") == "1"
+
+
 def relative_bias_shift(rel_logits: torch.Tensor, q_start: torch.Tensor, kv_len: int, extent: int,
                         kv_start: torch.Tensor | None = None) -> torch.Tensor:
     """``relative_bias`` for queries at consecutive positions ``q_start + s`` against keys at consecutive positions
@@ -168,6 +172,11 @@ def relative_bias_shift(rel_logits: torch.Tensor, q_start: torch.Tensor, kv_len:
         key_pos = key_pos + kv_start.view(-1, 1)
     col = key_pos - (q_start.view(-1, 1) - E + 1)                                                       # [B, L]
     col = torch.where((col >= 0) & (col < E + S - 1), col, torch.full_like(col, E + S - 1))
+    if S > 1 and ONEHOT_SHIFT:
+        # prefill: place the band with a one-hot matmul (TensorEngine) instead of an index_select along the last dim,
+        # which Neuron runs as an indirect copy per element (software DMA descriptors on GpSimd); exact (one term)
+        onehot = (torch.arange(E + S, device=col.device).view(1, -1, 1) == col.view(B, 1, -1)).to(f.dtype)
+        return torch.matmul(f.reshape(B, h * S, E + S), onehot).view(B, h, S, kv_len)
     out = torch.stack([f[b].index_select(-1, col[b]) for b in range(B)]) if B > 1 else f.index_select(-1, col[0])
     return out
 

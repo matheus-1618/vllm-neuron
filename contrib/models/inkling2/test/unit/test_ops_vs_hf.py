@@ -217,6 +217,10 @@ def test_relative_bias_shift_matches_gather(B, S, start, L, E, kv0):
     ref = ops.relative_bias(rel, q_pos.unsqueeze(-1) - kv_pos.unsqueeze(1), E)
     ours = ops.relative_bias_shift(rel, q_start, L, E, kv_start)
     assert torch.equal(ref, ours)
+    if S > 1:   # the prefill's one-hot matmul form (INKLING2_ONEHOT_SHIFT=1) is exact too
+        import unittest.mock
+        with unittest.mock.patch.object(ops, "ONEHOT_SHIFT", True):
+            assert torch.equal(ref, ops.relative_bias_shift(rel, q_start, L, E, kv_start))
 
 
 @pytest.mark.parametrize("B,S,starts,nb,block,window", [(1, 512, [0], 64, 256, 1024), (1, 512, [5000], 64, 256, 1024),
