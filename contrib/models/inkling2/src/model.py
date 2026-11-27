@@ -146,13 +146,20 @@ class PagedIO(ops.LayerIO):
         q0 = positions[:, 0]
         self.read_pos = (q0 - 1).clamp(min=0)
         self.write_pos = q0 + (valid - 1 if S > 1 else 0)
+        if os.environ.get("INKLING2_DBG_STATE_FIRST") == "1":     # debug: the record at the request's first block
+            self.read_pos = torch.zeros_like(q0)
+            self.write_pos = torch.zeros_like(q0)
         rows = []
         for j in range(STATE_LAYERS):
             blk = self._block_of(state_name(j), self.read_pos, bs)
             # whole blocks through the flat buffer (an element-indexed gather of the record costs an indirect copy
             # per element: measured 16.7 ms a row a step)
             flat, dims = model._state_flat[j]
-            kb, vb = KV.gather_kv(flat, blk, dims)
+            if os.environ.get("INKLING2_DBG_STATE_TORCH") == "1":     # debug: the record through torch ops
+                planes = flat.view(2, *dims)
+                kb, vb = planes[0].index_select(0, blk), planes[1].index_select(0, blk)
+            else:
+                kb, vb = KV.gather_kv(flat, blk, dims)
             rows += [kb.reshape(B, -1), vb.reshape(B, -1)]
         rec = torch.cat(rows, dim=1)[:, :L.total]
         if reset is not None:
@@ -183,7 +190,28 @@ class PagedIO(ops.LayerIO):
         flat, dims = self.m._kv_flat[c]
         n, _, block, d = dims
         blk, pos = paged_slot_indices(self.md[name]["slot_mapping"].reshape(-1), block, n)
-        token = KV.write_kv(flat, k.transpose(1, 2).reshape(-1, d), v.transpose(1, 2).reshape(-1, d), blk, pos, 1, dims)
+        kv_torch = os.environ.get("INKLING2_DBG_KV_TORCH2") == "1"     # debug: KV through torch ops on 5-D views
+        if os.environ.get("INKLING2_DBG_KV_RAW") == "1":                 # debug: the validated torch path
+            kc, vc = self.m._kv_raw[c]
+            kc[blk, 0, pos] = k.transpose(1, 2).reshape(-1, d)
+            vc[blk, 0, pos] = v.transpose(1, 2).reshape(-1, d)
+            table, first = self._table(name)
+            if window is not None and self.S > 1:
+                blocks, first = ops.window_blocks(table, self.positions[:, 0], self.S, window, block)
+            else:
+                blocks = table
+            nr = blocks.shape[1]
+            k_ctx = kc.index_select(0, blocks.reshape(-1)).view(self.B, 1, nr * block, d)
+            v_ctx = vc.index_select(0, blocks.reshape(-1)).view(self.B, 1, nr * block, d)
+            kv_pos = first.view(-1, 1) + torch.arange(nr * block, device=k.device).view(1, -1)
+            return k_ctx, v_ctx, kv_pos
+        if kv_torch:
+            planes = flat.view(2, *dims)
+            planes[0][blk, 0, pos] = k.transpose(1, 2).reshape(-1, d)
+            planes[1][blk, 0, pos] = v.transpose(1, 2).reshape(-1, d)
+        else:
+            token = KV.write_kv(flat, k.transpose(1, 2).reshape(-1, d), v.transpose(1, 2).reshape(-1, d), blk, pos,
+                                1, dims)
         table, first = self._table(name)
         if window is not None and self.S > 1 and os.environ.get("INKLING2_DBG_SLIDING_FULLREAD") != "1":
             # a sliding layer's prefill chunk reads only the blocks of its window (about S + window keys)
@@ -192,7 +220,11 @@ class PagedIO(ops.LayerIO):
             # full layers read the request's table; a sliding layer's decode table is already cut to the window
             blocks = table
         nr = blocks.shape[1]
-        kb, vb = KV.gather_kv(flat, blocks.reshape(-1), dims, after=token)
+        if kv_torch:
+            planes = flat.view(2, *dims)
+            kb, vb = planes[0].index_select(0, blocks.reshape(-1)), planes[1].index_select(0, blocks.reshape(-1))
+        else:
+            kb, vb = KV.gather_kv(flat, blocks.reshape(-1), dims, after=token)
         k_ctx, v_ctx = kb.reshape(self.B, 1, nr * block, d), vb.reshape(self.B, 1, nr * block, d)
         kv_pos = first.view(-1, 1) + torch.arange(nr * block, device=k.device).view(1, -1)
         return k_ctx, v_ctx, kv_pos
@@ -246,6 +278,12 @@ class PagedIO(ops.LayerIO):
         for j in range(STATE_LAYERS):
             flat, dims = self.m._state_flat[j]
             d = dims[-1]
+            if os.environ.get("INKLING2_DBG_STATE_TORCH") == "1":
+                planes = flat.view(2, *dims)
+                b_idx = blk[j].repeat_interleave(bs)
+                planes[0][b_idx, 0, pos] = rec[:, (2 * j) * L.plane_block:(2 * j + 1) * L.plane_block].reshape(-1, d)
+                planes[1][b_idx, 0, pos] = rec[:, (2 * j + 1) * L.plane_block:(2 * j + 2) * L.plane_block].reshape(-1, d)
+                continue
             KV.write_kv(flat, rec[:, (2 * j) * L.plane_block:(2 * j + 1) * L.plane_block].reshape(-1, d),
                         rec[:, (2 * j + 1) * L.plane_block:(2 * j + 2) * L.plane_block].reshape(-1, d),
                         blk[j].repeat_interleave(bs), pos, 1, dims)
@@ -354,9 +392,11 @@ class Inkling2ForCausalLM(nn.Module):
             raise RuntimeError("the Inkling 2 model was built outside a vLLM engine config")
         self.state_layout = StateLayout(c, self.block_size)
 
+        no_swa = os.environ.get("INKLING2_DBG_NO_SWA_SPEC") == "1"     # debug: every layer a full-attention layer
+
         def spec(name, sliding):
             return LayerSpec(name=name, num_kv_heads=c.kv_heads_per_rank, head_size=c.head_dim, dtype=DTYPE,
-                             sliding_window_size=c.window if sliding else None)
+                             sliding_window_size=c.window if sliding and not no_swa else None)
 
         layers = [spec(cache_name(i), not c.is_full(c.cache_layer_model(i))) for i in range(c.cache_layers)]
         layers += [spec(state_name(j), True) for j in range(STATE_LAYERS)]
@@ -384,6 +424,9 @@ class Inkling2ForCausalLM(nn.Module):
             return self._flat_kv(k, v, shared), tuple(int(x) for x in k.shape)
 
         self._kv_flat = [flat(cache_name(i)) for i in range(self.config.cache_layers)]
+        # debug (INKLING2_DBG_KV_RAW=1): the cache tensors as given, for the validated torch path
+        self._kv_raw = [(kv_caches[cache_name(i)][0], kv_caches[cache_name(i)][1])
+                        for i in range(self.config.cache_layers)]
         self._state_flat = [flat(state_name(j)) for j in range(STATE_LAYERS)]
         L = self.state_layout
         for name, (_, shape) in zip([state_name(j) for j in range(STATE_LAYERS)], self._state_flat):

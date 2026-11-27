@@ -17,7 +17,13 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron import envs
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.neuron_utils import can_run_kernel as _can_run_kernel
+
+
+def can_run_kernel(t):
+    # debug (INKLING2_DBG_KV_TORCH=1): the torch fallbacks on the device too
+    import os
+    return os.environ.get("INKLING2_DBG_KV_TORCH") != "1" and _can_run_kernel(t)
 
 _TILE = 128  # rows per indirect DMA (one per SBUF partition)
 # The compiler pins the dynamic-DMA scratch at SBUF [0, 16 KB); user tiles start above it.
@@ -59,7 +65,7 @@ def _kv_rows_write_kernel(pool, rows, row_index):
     buf_base = at_base + 256
 
     idx = nl.ndarray(
-        (_TILE, tiles), dtype=nl.int32, buffer=nl.sbuf, name="kvw_idx", address=(0, _SBUF_BASE)
+        (_TILE, tiles), dtype=nl.int32, buffer=nl.sbuf, name="kvw_idx"
     )
     # [tiles, 128] in HBM -> [128, tiles] in SBUF: the transpose by the DMA's access pattern, not by a torch op
     nisa.dma_copy(dst=idx, src=row_index.ap(pattern=[[1, _TILE], [_TILE, tiles]], offset=0))
@@ -67,14 +73,12 @@ def _kv_rows_write_kernel(pool, rows, row_index):
     ats = [
         nl.ndarray(
             (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name=f"kvw_at{k}",
-            address=(0, at_base + 64 * k),
         )
         for k in range(n_buf)
     ]
     bufs = [
         nl.ndarray(
             (_TILE, width), dtype=rows.dtype, buffer=nl.sbuf, name=f"kvw_rows{k}",
-            address=(0, buf_base + _MAX_ROW_BYTES * k),
         )
         for k in range(n_buf)
     ]
@@ -96,7 +100,7 @@ def _kv_rows_write_kernel(pool, rows, row_index):
     # A zero token that exists only once the kernel has run: a later kernel that consumes it
     # starts after every row above is written (ordering without reading the cache alias).
     zero = nl.ndarray(
-        (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name="kvw_zero", address=(0, at_base + 128)
+        (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name="kvw_zero"
     )
     nisa.tensor_scalar(dst=zero, data=idx[0:_TILE, 0:1], op0=nl.multiply, operand0=0)
     nisa.dma_copy(dst=done, src=zero)
@@ -137,30 +141,28 @@ def _kv_rows_gather_kernel(pool, row_index, after, width: int):
     buf_base = at_base + 256
 
     idx = nl.ndarray(
-        (_TILE, tiles), dtype=nl.int32, buffer=nl.sbuf, name="kvg_idx", address=(0, _SBUF_BASE)
+        (_TILE, tiles), dtype=nl.int32, buffer=nl.sbuf, name="kvg_idx"
     )
     # [tiles, 128] in HBM -> [128, tiles] in SBUF: the transpose by the DMA's access pattern, not by a torch op
     nisa.dma_copy(dst=idx, src=row_index.ap(pattern=[[1, _TILE], [_TILE, tiles]], offset=0))
     edge = nl.ndarray(
-        (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name="kvg_edge", address=(0, at_base + 128)
+        (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name="kvg_edge"
     )
     nisa.dma_copy(dst=edge, src=after)
     zero = nl.ndarray(
-        (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name="kvg_zero", address=(0, at_base + 192)
+        (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name="kvg_zero"
     )
     nisa.tensor_scalar(dst=zero, data=edge, op0=nl.multiply, operand0=0)
     n_buf = min(2, tiles)
     ats = [
         nl.ndarray(
             (_TILE, 1), dtype=nl.int32, buffer=nl.sbuf, name=f"kvg_at{k}",
-            address=(0, at_base + 64 * k),
         )
         for k in range(n_buf)
     ]
     bufs = [
         nl.ndarray(
             (_TILE, width), dtype=pool.dtype, buffer=nl.sbuf, name=f"kvg_rows{k}",
-            address=(0, buf_base + _MAX_ROW_BYTES * k),
         )
         for k in range(n_buf)
     ]

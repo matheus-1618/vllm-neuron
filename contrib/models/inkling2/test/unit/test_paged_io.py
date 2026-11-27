@@ -157,6 +157,7 @@ def model_stub(cfg, caches, names):
         return M.Inkling2ForCausalLM._flat_kv(k, v, shared), tuple(k.shape)
 
     m._kv_flat = [flat(M.cache_name(c)) for c in range(cfg.cache_layers)]
+    m._kv_raw = [caches[M.cache_name(c)] for c in range(cfg.cache_layers)]
     m._state_flat = [flat(M.state_name(j)) for j in range(M.STATE_LAYERS)]
     return m
 
