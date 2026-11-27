@@ -97,3 +97,21 @@ def test_moe_prefill_grouped_matches_dense(T, E_):
     tok, wt, nt = K5.tables(idx, w, E_)
     out = torch.as_tensor(nki.simulate(K5.inkling2_moe_prefill)(x, tok, wt, nt, gate_up, down)).float()
     assert (out - ref).abs().max() <= 1e-2 * ref.abs().max()
+
+
+@pytest.mark.parametrize("T,E_", [(64, 16), (256, 128)])
+def test_moe_prefill_tiles_matches_dense(T, E_):
+    from inkling2_neuron.kernels import moe_prefill_tiles as K6
+
+    g = torch.Generator().manual_seed(4)
+    x = (torch.randn(T, H, generator=g) * 0.5).bfloat16()
+    gate_up = (torch.randn(E_, H, 2 * I, generator=g) * 0.03).bfloat16()
+    down = (torch.randn(E_, I, H, generator=g) * 0.03).bfloat16()
+    idx = torch.stack([torch.randperm(E_, generator=g)[:K] for _ in range(T)])
+    idx[: T // 2, 0] = 0             # one expert with many tokens (several tiles)
+    idx[: T // 2] = torch.stack([torch.cat([torch.zeros(1, dtype=idx.dtype),
+                                            torch.randperm(E_ - 1, generator=g)[:K - 1] + 1]) for _ in range(T // 2)])
+    w = torch.rand(T, K, generator=g)
+    ref = ops.moe_dense(x, idx, w, gate_up, down, 4.0, 25.0, group=min(E_, 32))
+    out = K6.moe_prefill(lambda k_: (lambda *a: torch.as_tensor(nki.simulate(k_)(*a))), x, idx, w, gate_up, down)
+    assert (out - ref).abs().max() <= 1e-2 * ref.abs().max()
